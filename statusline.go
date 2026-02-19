@@ -213,14 +213,10 @@ func (s *StatusLine) Clear() {
 //
 // When not a TTY, writes pass through directly to the underlying writer.
 func (s *StatusLine) Write(p []byte) (n int, err error) {
-	if !s.isTTY {
-		return s.w.Write(p)
-	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if !s.active {
+	if !s.isTTY || !s.active {
 		return s.w.Write(p)
 	}
 
@@ -336,21 +332,22 @@ func (s *StatusLine) renderStatus() string {
 
 	if !s.noSpin {
 		frame := s.frames[s.frameIdx%len(s.frames)]
-		parts = append(parts, s.style.Render(frame))
+		parts = append(parts, frame)
 	}
 
 	if s.text != "" {
-		parts = append(parts, s.style.Render(s.text))
+		parts = append(parts, s.text)
 	}
 
-	status := "  " + strings.Join(parts, " ")
+	raw := "  " + strings.Join(parts, " ")
 
-	// Truncate to terminal width to prevent wrapping
-	if s.width > 0 && len(status) > s.width-1 {
-		status = status[:s.width-1]
+	// Truncate by visible rune count to prevent wrapping
+	runes := []rune(raw)
+	if s.width > 0 && len(runes) > s.width-1 {
+		raw = string(runes[:s.width-1])
 	}
 
-	return status
+	return s.style.Render(raw)
 }
 
 // trackContent updates cursor tracking state based on written content.
