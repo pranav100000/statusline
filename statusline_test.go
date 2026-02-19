@@ -3,13 +3,47 @@ package statusline
 import (
 	"bytes"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
 )
+
+// ansiCsiRe matches CSI sequences: \033[ ... letter
+var ansiCsiRe = regexp.MustCompile(`\033\[[^a-zA-Z]*[a-zA-Z]`)
+
+// ansiEscRe matches ESC + single character sequences (e.g., \0337 DECSC, \0338 DECRC)
+var ansiEscRe = regexp.MustCompile(`\033[^[\x1b]`)
+
+// extractContent strips all ANSI sequences, control characters, spinner frames,
+// and known status strings from raw output, then removes all spaces so that
+// character-by-character streamed content can be reassembled. The caller checks
+// for space-stripped versions of expected phrases.
+func extractContent(b []byte, statuses []string) []byte {
+	b = ansiCsiRe.ReplaceAll(b, nil)
+	b = ansiEscRe.ReplaceAll(b, nil)
+	b = bytes.ReplaceAll(b, []byte("\r"), nil)
+	b = bytes.ReplaceAll(b, []byte("\n"), nil)
+	for _, frame := range defaultFrames {
+		b = bytes.ReplaceAll(b, []byte(frame), nil)
+	}
+	for _, s := range statuses {
+		b = bytes.ReplaceAll(b, []byte(s), nil)
+	}
+	// Remove all spaces — status rendering inserts padding that ends up
+	// between every content character after the above removals.
+	b = bytes.ReplaceAll(b, []byte(" "), nil)
+	return b
+}
+
+// stripSpaces removes all spaces from a string for content comparison.
+func stripSpaces(s string) string {
+	return strings.ReplaceAll(s, " ", "")
+}
 
 // writeRecorder records each individual Write() call separately.
 // If flicker exists, you'll see multiple writes where there should be one.
@@ -491,6 +525,118 @@ func TestConcurrentWriteAndSetNoInterleaving(t *testing.T) {
 			if !bytes.Contains(all, []byte(expected)) {
 				t.Errorf("missing content: %q", expected)
 			}
+		}
+	}
+}
+
+func TestStreamingWithConcurrentStatusUpdates(t *testing.T) {
+	rec := &writeRecorder{}
+	s := &StatusLine{
+		w: rec, isTTY: true, active: true,
+		width: 80, height: 24,
+		frames:         defaultFrames,
+		style:          lipgloss.NewStyle(),
+		lastWasNewline: true,
+		statusRendered: true,
+	}
+
+	streamText := `Here's what I found after analyzing the codebase:
+
+The database connection pool is configured in config/database.go
+with a max of 25 connections. The pool uses a FIFO strategy
+and connections are recycled every 5 minutes.
+
+Key findings:
+- Connection timeouts are set to 30 seconds
+- Idle connections are closed after 10 minutes
+- The pool size scales based on CPU count
+
+Run go test to verify the changes work correctly.
+`
+
+	statuses := []string{
+		"Reading src/main.go",
+		"Searching for references...",
+		"Analyzing imports...",
+		"Reading config/database.go",
+		"Writing changes...",
+		"Formatting code...",
+	}
+
+	var wg sync.WaitGroup
+
+	// Goroutine 1: stream text rune-by-rune
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for _, ch := range streamText {
+			s.Write([]byte(string(ch)))
+		}
+	}()
+
+	// Goroutine 2: cycle through status updates
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for _, status := range statuses {
+			s.Set(status)
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	// Goroutine 3: simulate spinner ticks
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			s.mu.Lock()
+			s.frameIdx++
+			s.redraw()
+			s.mu.Unlock()
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	wg.Wait()
+
+	// Assertion 1: no empty writes
+	for i, w := range rec.writes {
+		if len(w) == 0 {
+			t.Errorf("write %d is empty", i)
+		}
+	}
+
+	// Assertion 2: all content arrives (after stripping ANSI and status text)
+	// Since character-by-character writes interleave status redraws between
+	// every char, we strip everything non-content (including spaces) and
+	// compare against space-stripped phrases.
+	content := extractContent(bytes.Join(rec.writes, nil), statuses)
+	phrases := []string{
+		"Here's what I found",
+		"database connection pool",
+		"Run go test to verify",
+	}
+	for _, phrase := range phrases {
+		if !bytes.Contains(content, []byte(stripSpaces(phrase))) {
+			t.Errorf("missing phrase in output: %q", phrase)
+		}
+	}
+
+	// Assertion 3: no merged operations — each write has <= 2 occurrences of \033[K
+	for i, w := range rec.writes {
+		count := bytes.Count(w, []byte("\033[K"))
+		if count > 2 {
+			t.Errorf("write %d has %d \\033[K sequences (max 2), possible merged operations", i, count)
+		}
+	}
+
+	// Assertion 4: escape sequence integrity — no write ends with a truncated escape
+	for i, w := range rec.writes {
+		if bytes.HasSuffix(w, []byte("\033")) {
+			t.Errorf("write %d ends with truncated escape \\033", i)
+		}
+		if bytes.HasSuffix(w, []byte("\033[")) {
+			t.Errorf("write %d ends with truncated escape \\033[", i)
 		}
 	}
 }

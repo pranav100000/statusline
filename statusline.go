@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -57,11 +58,10 @@ type StatusLine struct {
 	style lipgloss.Style
 
 	// state tracking
-	active             bool
-	statusRendered     bool
-	statusBelowPartial bool
-	lastWasNewline     bool
-	partialWidth       int
+	active         bool
+	statusRendered bool
+	lastWasNewline bool
+	partialWidth   int
 
 	// concurrency
 	mu     sync.Mutex
@@ -130,10 +130,24 @@ func (s *StatusLine) Start() {
 
 	s.active = true
 
+	// Query current cursor position before DECSTBM resets it to 1;1
+	cursorRow := s.getCursorRow()
+
+	// If cursor is on the last row (status bar territory), scroll up to make room
+	if cursorRow >= s.height {
+		fmt.Fprint(s.w, "\n")
+		cursorRow = s.height - 1
+	}
+
+	// Fallback: if query failed, start at bottom of scroll region
+	if cursorRow == 0 {
+		cursorRow = s.height - 1
+	}
+
 	// Set scroll region to all rows except the last
 	fmt.Fprintf(s.w, "\033[1;%dr", s.height-1)
-	// Move cursor to top-left of scroll region
-	fmt.Fprint(s.w, "\033[1;1H")
+	// Restore cursor to where it was (DECSTBM resets to 1;1)
+	fmt.Fprintf(s.w, "\033[%d;1H", cursorRow)
 
 	// Install SIGWINCH handler for terminal resize
 	s.sigWinch = make(chan os.Signal, 1)
@@ -293,32 +307,19 @@ func (s *StatusLine) redraw() {
 }
 
 // writeRedraw writes the status line escape sequence to buf. Must be called with mu held.
+// Uses DECSC/DECRC to save and restore the cursor position, then draws the
+// status on the fixed row s.height (outside the scroll region). This avoids
+// relative cursor movement that breaks at terminal-width wrap boundaries.
 func (s *StatusLine) writeRedraw(buf *bytes.Buffer) {
 	content := s.renderStatus()
-
-	if s.lastWasNewline {
-		fmt.Fprintf(buf, "\r\033[K%s", content)
-		s.statusBelowPartial = false
-	} else {
-		col := (s.partialWidth % s.width) + 1
-		fmt.Fprintf(buf, "\n\r\033[K%s\033[1A\033[%dG", content, col)
-		s.statusBelowPartial = true
-	}
-
+	fmt.Fprintf(buf, "\0337\033[%d;1H\033[K%s\0338", s.height, content)
 	s.statusRendered = true
 }
 
 // writeClearStatus writes the escape sequence to clear the status line to buf.
 // Must be called with mu held.
 func (s *StatusLine) writeClearStatus(buf *bytes.Buffer) {
-	if s.statusBelowPartial {
-		// Status is on the line below partial content — move down, clear, move back
-		col := (s.partialWidth % s.width) + 1
-		fmt.Fprintf(buf, "\n\r\033[K\033[1A\033[%dG", col)
-	} else {
-		// Status is on current line — just clear it
-		buf.WriteString("\r\033[K")
-	}
+	fmt.Fprintf(buf, "\0337\033[%d;1H\033[K\0338", s.height)
 	s.statusRendered = false
 }
 
@@ -364,6 +365,55 @@ func (s *StatusLine) trackContent(p []byte) {
 	}
 }
 
+// getCursorRow queries the terminal for the current cursor row using DSR
+// (Device Status Report). Returns 0 if the query fails.
+func (s *StatusLine) getCursorRow() int {
+	tty, err := os.Open("/dev/tty")
+	if err != nil {
+		return 0
+	}
+	defer tty.Close()
+
+	ttyFd := int(tty.Fd())
+
+	oldState, err := term.MakeRaw(ttyFd)
+	if err != nil {
+		return 0
+	}
+	defer term.Restore(ttyFd, oldState)
+
+	// Request cursor position — terminal responds with \033[row;colR
+	fmt.Fprint(s.w, "\033[6n")
+
+	tty.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+
+	var response []byte
+	buf := make([]byte, 1)
+	for {
+		n, err := tty.Read(buf)
+		if err != nil || n == 0 {
+			return 0
+		}
+		response = append(response, buf[0])
+		if buf[0] == 'R' {
+			break
+		}
+	}
+
+	// Parse \033[row;colR
+	resp := string(response)
+	start := strings.Index(resp, "[")
+	semi := strings.Index(resp, ";")
+	if start < 0 || semi < 0 {
+		return 0
+	}
+	row, err := strconv.Atoi(resp[start+1 : semi])
+	if err != nil {
+		return 0
+	}
+	return row
+}
+
 // handleResize re-queries terminal size and re-sets the scroll region.
 // Must be called with mu held.
 func (s *StatusLine) handleResize() {
@@ -374,8 +424,11 @@ func (s *StatusLine) handleResize() {
 	s.width = w
 	s.height = h
 
-	// Re-set scroll region for new dimensions
+	// Save cursor, re-set scroll region, restore cursor.
+	// DECSTBM resets cursor to 1;1, so we bracket with DECSC/DECRC.
+	fmt.Fprint(s.w, "\0337")
 	fmt.Fprintf(s.w, "\033[1;%dr", s.height-1)
+	fmt.Fprint(s.w, "\0338")
 
 	if s.active {
 		s.redraw()
