@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"golang.org/x/term"
 )
 
@@ -47,6 +48,7 @@ type StatusLine struct {
 
 	// status content
 	text string
+	raw  bool
 
 	// spinner
 	frames   []string
@@ -55,10 +57,12 @@ type StatusLine struct {
 	noSpin   bool
 
 	// styling
-	style lipgloss.Style
+	style    lipgloss.Style
+	ellipsis string
 
 	// state tracking
 	active         bool
+	paused         bool
 	statusRendered bool
 	lastWasNewline bool
 	partialWidth   int
@@ -200,6 +204,64 @@ func (s *StatusLine) Stop() {
 	s.resetTerminal()
 }
 
+// Pause temporarily clears the status line and resets the scroll region,
+// allowing other programs (e.g. interactive prompts) to use the full terminal.
+// The background goroutine stays alive — call Resume() to restore the status line.
+func (s *StatusLine) Pause() {
+	if !s.isTTY {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.active || s.paused {
+		return
+	}
+	s.paused = true
+
+	var buf bytes.Buffer
+	fmt.Fprint(&buf, "\0337")                            // DECSC — save cursor
+	fmt.Fprintf(&buf, "\033[%d;1H\033[K", s.height)     // clear status row
+	fmt.Fprint(&buf, "\033[r")                           // reset scroll region (cursor → 1;1)
+	fmt.Fprint(&buf, "\0338")                            // DECRC — restore cursor
+	s.w.Write(buf.Bytes())
+}
+
+// Resume restores the status line after a Pause(). Re-queries terminal size
+// (which may have changed), re-sets the scroll region, and redraws.
+func (s *StatusLine) Resume() {
+	if !s.isTTY {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.active || !s.paused {
+		return
+	}
+	s.paused = false
+
+	// Re-query terminal size (may have changed while paused)
+	w, h, err := term.GetSize(s.fd)
+	if err == nil {
+		s.width = w
+		s.height = h
+	}
+
+	// Reset cursor tracking — interactive prompts end with newline
+	s.lastWasNewline = true
+	s.partialWidth = 0
+	s.statusRendered = false
+
+	// Re-set scroll region and redraw in one write
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "\033[1;%dr", s.height-1)
+	s.writeRedraw(&buf)
+	s.w.Write(buf.Bytes())
+}
+
 // Set updates the status line text. Thread-safe. Can be called from any
 // goroutine at any time while the status line is active.
 func (s *StatusLine) Set(text string) {
@@ -211,9 +273,37 @@ func (s *StatusLine) Set(text string) {
 	defer s.mu.Unlock()
 
 	s.text = text
+	s.raw = false
 	if s.active {
 		s.redraw()
 	}
+}
+
+// SetRaw updates the status line with pre-styled text. Unlike Set(), the text
+// is not passed through the lipgloss style — it is rendered as-is (with an
+// optional spinner prefix). Use Width() to measure available space when
+// formatting your own styled text.
+func (s *StatusLine) SetRaw(text string) {
+	if !s.isTTY {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.text = text
+	s.raw = true
+	if s.active {
+		s.redraw()
+	}
+}
+
+// Width returns the current terminal width. Useful for pre-formatting styled
+// text for SetRaw().
+func (s *StatusLine) Width() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.width
 }
 
 // Clear removes the status text. The bottom row remains reserved.
@@ -231,6 +321,9 @@ func (s *StatusLine) Write(p []byte) (n int, err error) {
 	defer s.mu.Unlock()
 
 	if !s.isTTY || !s.active {
+		return s.w.Write(p)
+	}
+	if s.paused {
 		return s.w.Write(p)
 	}
 
@@ -276,7 +369,7 @@ func (s *StatusLine) loop() {
 		case <-tickCh:
 			s.mu.Lock()
 			s.frameIdx++
-			if s.active {
+			if s.active && !s.paused {
 				s.redraw()
 			}
 			s.mu.Unlock()
@@ -325,6 +418,20 @@ func (s *StatusLine) writeClearStatus(buf *bytes.Buffer) {
 
 // renderStatus builds the formatted status string.
 func (s *StatusLine) renderStatus() string {
+	// Raw mode: text is pre-styled, only add optional spinner prefix
+	if s.raw && s.text != "" {
+		var prefix string
+		if !s.noSpin {
+			frame := s.frames[s.frameIdx%len(s.frames)]
+			prefix = s.style.Render("  "+frame) + " "
+		}
+		result := prefix + s.text
+		if s.width > 0 && ansi.StringWidth(result) > s.width-1 {
+			result = ansi.Truncate(result, s.width-1, s.ellipsis)
+		}
+		return result
+	}
+
 	if s.text == "" && s.noSpin {
 		return ""
 	}
@@ -342,10 +449,9 @@ func (s *StatusLine) renderStatus() string {
 
 	raw := "  " + strings.Join(parts, " ")
 
-	// Truncate by visible rune count to prevent wrapping
-	runes := []rune(raw)
-	if s.width > 0 && len(runes) > s.width-1 {
-		raw = string(runes[:s.width-1])
+	// Truncate by visible width to prevent wrapping
+	if s.width > 0 && ansi.StringWidth(raw) > s.width-1 {
+		raw = ansi.Truncate(raw, s.width-1, s.ellipsis)
 	}
 
 	return s.style.Render(raw)
@@ -438,6 +544,8 @@ func (s *StatusLine) handleResize() {
 // resetTerminal restores the terminal to normal state. Must be called with mu held.
 // Safe to call multiple times.
 func (s *StatusLine) resetTerminal() {
+	// Clear the status row before resetting scroll region
+	fmt.Fprintf(s.w, "\033[%d;1H\033[K", s.height)
 	// Reset scroll region to full screen
 	fmt.Fprint(s.w, "\033[r")
 	// Move to bottom and print newline for clean shell prompt

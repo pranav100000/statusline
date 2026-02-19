@@ -49,6 +49,16 @@ func WithStyle(style lipgloss.Style) Option {
 	}
 }
 
+// WithEllipsis sets the suffix appended when status text is truncated to fit
+// the terminal width. Defaults to "" (hard truncation).
+//
+//	status := statusline.New(os.Stdout, statusline.WithEllipsis("…"))
+func WithEllipsis(s string) Option {
+	return func(sl *StatusLine) {
+		sl.ellipsis = s
+	}
+}
+
 // WithWriter sets the file descriptor used for terminal size queries.
 // This is only needed if the io.Writer passed to New() is not an *os.File.
 // In most cases you don't need this.

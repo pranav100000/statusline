@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // ansiCsiRe matches CSI sequences: \033[ ... letter
@@ -333,9 +334,9 @@ func TestTruncationUnicode(t *testing.T) {
 	if !utf8.ValidString(result) {
 		t.Fatalf("result is not valid UTF-8: %q", result)
 	}
-	runes := []rune(result)
-	if len(runes) > s.width-1 {
-		t.Fatalf("renderStatus returned %d runes, want <= %d: %q", len(runes), s.width-1, result)
+	displayWidth := ansi.StringWidth(result)
+	if displayWidth > s.width-1 {
+		t.Fatalf("renderStatus display width = %d, want <= %d: %q", displayWidth, s.width-1, result)
 	}
 }
 
