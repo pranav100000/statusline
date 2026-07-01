@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/term"
 )
 
 // Option configures a StatusLine.
@@ -18,7 +19,7 @@ type Option func(*StatusLine)
 func WithSpinner(frames []string, interval time.Duration) Option {
 	return func(s *StatusLine) {
 		if len(frames) > 0 {
-			s.frames = frames
+			s.frames = cloneStrings(frames)
 		}
 		if interval > 0 {
 			s.interval = interval
@@ -59,13 +60,14 @@ func WithEllipsis(s string) Option {
 	}
 }
 
-// WithWriter sets the file descriptor used for terminal size queries.
+// WithFd sets the file descriptor used for TTY detection and terminal size
+// queries.
 // This is only needed if the io.Writer passed to New() is not an *os.File.
 // In most cases you don't need this.
 func WithFd(fd int) Option {
 	return func(s *StatusLine) {
 		s.fd = fd
-		s.isTTY = true
+		s.isTTY = term.IsTerminal(fd)
 	}
 }
 

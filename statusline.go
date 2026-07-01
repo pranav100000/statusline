@@ -23,7 +23,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
@@ -31,7 +30,17 @@ import (
 	"golang.org/x/term"
 )
 
-// Default braille spinner frames.
+const (
+	defaultInterval = 80 * time.Millisecond
+	defaultWidth    = 80
+	defaultHeight   = 24
+	minWidth        = 1
+	minHeight       = 2
+)
+
+// Default braille spinner frames. The slice is never assigned directly to a
+// StatusLine so callers cannot mutate a running status line by changing a
+// package-level spinner slice.
 var defaultFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 // StatusLine pins a single line at the bottom of the terminal while allowing
@@ -42,9 +51,10 @@ type StatusLine struct {
 	fd int       // file descriptor for terminal size queries
 
 	// terminal state
-	width  int
-	height int
-	isTTY  bool
+	width     int
+	height    int
+	isTTY     bool
+	cursorRow func() int
 
 	// status content
 	text string
@@ -64,14 +74,11 @@ type StatusLine struct {
 	active         bool
 	paused         bool
 	statusRendered bool
-	lastWasNewline bool
-	partialWidth   int
 
 	// concurrency
-	mu     sync.Mutex
-	ticker *time.Ticker
-	done   chan struct{}
-	wg     sync.WaitGroup
+	mu   sync.Mutex
+	done chan struct{}
+	wg   sync.WaitGroup
 
 	// signal handling
 	sigWinch chan os.Signal
@@ -87,12 +94,10 @@ type StatusLine struct {
 //	status := statusline.New(os.Stdout)
 func New(w io.Writer, opts ...Option) *StatusLine {
 	s := &StatusLine{
-		w:              w,
-		frames:         defaultFrames,
-		interval:       80 * time.Millisecond,
-		style:          lipgloss.NewStyle().Faint(true),
-		lastWasNewline: true,
-		done:           make(chan struct{}),
+		w:        w,
+		frames:   cloneStrings(defaultFrames),
+		interval: defaultInterval,
+		style:    lipgloss.NewStyle().Faint(true),
 	}
 
 	// Detect TTY and get file descriptor
@@ -106,7 +111,7 @@ func New(w io.Writer, opts ...Option) *StatusLine {
 	}
 
 	if s.isTTY {
-		s.width, s.height, _ = term.GetSize(s.fd)
+		s.updateTerminalSize()
 	}
 
 	return s
@@ -132,14 +137,18 @@ func (s *StatusLine) Start() {
 		return
 	}
 
+	s.updateTerminalSize()
 	s.active = true
+	s.done = make(chan struct{})
 
 	// Query current cursor position before DECSTBM resets it to 1;1
-	cursorRow := s.getCursorRow()
+	cursorRow := s.currentCursorRow()
+
+	var buf bytes.Buffer
 
 	// If cursor is on the last row (status bar territory), scroll up to make room
 	if cursorRow >= s.height {
-		fmt.Fprint(s.w, "\n")
+		fmt.Fprint(&buf, "\n")
 		cursorRow = s.height - 1
 	}
 
@@ -148,22 +157,26 @@ func (s *StatusLine) Start() {
 		cursorRow = s.height - 1
 	}
 
-	// Set scroll region to all rows except the last
-	fmt.Fprintf(s.w, "\033[1;%dr", s.height-1)
-	// Restore cursor to where it was (DECSTBM resets to 1;1)
-	fmt.Fprintf(s.w, "\033[%d;1H", cursorRow)
-
 	// Install SIGWINCH handler for terminal resize
 	s.sigWinch = make(chan os.Signal, 1)
-	signal.Notify(s.sigWinch, syscall.SIGWINCH)
+	notifyResize(s.sigWinch)
 
 	// Install SIGINT/SIGTERM safety net to reset scroll region
 	s.sigTerm = make(chan os.Signal, 1)
-	signal.Notify(s.sigTerm, syscall.SIGINT, syscall.SIGTERM)
+	notifyTermination(s.sigTerm)
+
+	// Set scroll region to all rows except the last
+	fmt.Fprintf(&buf, "\033[1;%dr", s.height-1)
+	// Restore cursor to where it was (DECSTBM resets to 1;1)
+	fmt.Fprintf(&buf, "\033[%d;1H", cursorRow)
+	if s.text != "" {
+		s.writeRedraw(&buf)
+	}
+	s.w.Write(buf.Bytes())
 
 	// Start background goroutine for spinner animation + signal handling
 	s.wg.Add(1)
-	go s.loop()
+	go s.loop(s.done, s.sigWinch, s.sigTerm)
 }
 
 // Stop deactivates the scroll region and restores normal terminal behavior.
@@ -178,30 +191,34 @@ func (s *StatusLine) Stop() {
 		s.mu.Unlock()
 		return
 	}
+	done := s.done
+	sigWinch := s.sigWinch
+	sigTerm := s.sigTerm
 	s.active = false
+	s.paused = false
 	s.mu.Unlock()
 
 	// Signal goroutine to stop and wait for it
-	close(s.done)
+	if done != nil {
+		close(done)
+	}
 	s.wg.Wait()
 
 	// Clean up signals
-	if s.sigWinch != nil {
-		signal.Stop(s.sigWinch)
+	if sigWinch != nil {
+		signal.Stop(sigWinch)
 	}
-	if s.sigTerm != nil {
-		signal.Stop(s.sigTerm)
-	}
-
-	// Stop ticker
-	if s.ticker != nil {
-		s.ticker.Stop()
+	if sigTerm != nil {
+		signal.Stop(sigTerm)
 	}
 
 	// Final cleanup under lock
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.resetTerminal()
+	s.done = nil
+	s.sigWinch = nil
+	s.sigTerm = nil
 }
 
 // Pause temporarily clears the status line and resets the scroll region,
@@ -221,11 +238,12 @@ func (s *StatusLine) Pause() {
 	s.paused = true
 
 	var buf bytes.Buffer
-	fmt.Fprint(&buf, "\0337")                            // DECSC — save cursor
-	fmt.Fprintf(&buf, "\033[%d;1H\033[K", s.height)     // clear status row
-	fmt.Fprint(&buf, "\033[r")                           // reset scroll region (cursor → 1;1)
-	fmt.Fprint(&buf, "\0338")                            // DECRC — restore cursor
+	fmt.Fprint(&buf, "\0337")                       // DECSC — save cursor
+	fmt.Fprintf(&buf, "\033[%d;1H\033[K", s.height) // clear status row
+	fmt.Fprint(&buf, "\033[r")                      // reset scroll region (cursor → 1;1)
+	fmt.Fprint(&buf, "\0338")                       // DECRC — restore cursor
 	s.w.Write(buf.Bytes())
+	s.statusRendered = false
 }
 
 // Resume restores the status line after a Pause(). Re-queries terminal size
@@ -243,16 +261,8 @@ func (s *StatusLine) Resume() {
 	}
 	s.paused = false
 
-	// Re-query terminal size (may have changed while paused)
-	w, h, err := term.GetSize(s.fd)
-	if err == nil {
-		s.width = w
-		s.height = h
-	}
-
-	// Reset cursor tracking — interactive prompts end with newline
-	s.lastWasNewline = true
-	s.partialWidth = 0
+	// Re-query terminal size (may have changed while paused).
+	s.updateTerminalSize()
 	s.statusRendered = false
 
 	// Re-set scroll region and redraw in one write
@@ -274,7 +284,7 @@ func (s *StatusLine) Set(text string) {
 
 	s.text = text
 	s.raw = false
-	if s.active {
+	if s.active && !s.paused {
 		s.redraw()
 	}
 }
@@ -293,7 +303,7 @@ func (s *StatusLine) SetRaw(text string) {
 
 	s.text = text
 	s.raw = true
-	if s.active {
+	if s.active && !s.paused {
 		s.redraw()
 	}
 }
@@ -337,55 +347,57 @@ func (s *StatusLine) Write(p []byte) (n int, err error) {
 	// Write content
 	buf.Write(p)
 
-	// Track whether last byte was a newline (for redraw positioning)
-	if len(p) > 0 {
-		s.trackContent(p)
-	}
-
 	// Redraw status
 	s.writeRedraw(&buf)
 
-	_, err = s.w.Write(buf.Bytes())
+	if buf.Len() == 0 {
+		return len(p), nil
+	}
+	written, err := s.w.Write(buf.Bytes())
+	if err != nil {
+		return 0, err
+	}
+	if written != buf.Len() {
+		return 0, io.ErrShortWrite
+	}
 	return len(p), err
 }
 
 // loop is the background goroutine that handles spinner animation and signals.
-func (s *StatusLine) loop() {
+func (s *StatusLine) loop(done <-chan struct{}, sigWinch <-chan os.Signal, sigTerm <-chan os.Signal) {
 	defer s.wg.Done()
 
-	if !s.noSpin {
-		s.ticker = time.NewTicker(s.interval)
-	}
-
 	var tickCh <-chan time.Time
-	if s.ticker != nil {
-		tickCh = s.ticker.C
+	if !s.noSpin {
+		ticker := time.NewTicker(s.interval)
+		defer ticker.Stop()
+		tickCh = ticker.C
 	}
 
 	for {
 		select {
-		case <-s.done:
+		case <-done:
 			return
 		case <-tickCh:
 			s.mu.Lock()
-			s.frameIdx++
+			s.advanceFrame()
 			if s.active && !s.paused {
 				s.redraw()
 			}
 			s.mu.Unlock()
-		case <-s.sigWinch:
+		case <-sigWinch:
 			s.mu.Lock()
 			s.handleResize()
 			s.mu.Unlock()
-		case <-s.sigTerm:
+		case sig := <-sigTerm:
 			// Safety net: reset scroll region before process exits
 			s.mu.Lock()
 			s.resetTerminal()
 			s.mu.Unlock()
 			// Re-raise the signal with default handler
-			signal.Reset(syscall.SIGINT, syscall.SIGTERM)
+			signal.Reset(sig)
 			p, _ := os.FindProcess(os.Getpid())
-			p.Signal(syscall.SIGINT)
+			p.Signal(sig)
 			return
 		}
 	}
@@ -396,6 +408,9 @@ func (s *StatusLine) loop() {
 func (s *StatusLine) redraw() {
 	var buf bytes.Buffer
 	s.writeRedraw(&buf)
+	if buf.Len() == 0 {
+		return
+	}
 	s.w.Write(buf.Bytes())
 }
 
@@ -405,6 +420,12 @@ func (s *StatusLine) redraw() {
 // relative cursor movement that breaks at terminal-width wrap boundaries.
 func (s *StatusLine) writeRedraw(buf *bytes.Buffer) {
 	content := s.renderStatus()
+	if content == "" {
+		if s.statusRendered {
+			s.writeClearStatus(buf)
+		}
+		return
+	}
 	fmt.Fprintf(buf, "\0337\033[%d;1H\033[K%s\0338", s.height, content)
 	s.statusRendered = true
 }
@@ -418,11 +439,12 @@ func (s *StatusLine) writeClearStatus(buf *bytes.Buffer) {
 
 // renderStatus builds the formatted status string.
 func (s *StatusLine) renderStatus() string {
+	frame := s.spinnerFrame()
+
 	// Raw mode: text is pre-styled, only add optional spinner prefix
 	if s.raw && s.text != "" {
 		var prefix string
-		if !s.noSpin {
-			frame := s.frames[s.frameIdx%len(s.frames)]
+		if frame != "" {
 			prefix = s.style.Render("  "+frame) + " "
 		}
 		result := prefix + s.text
@@ -432,14 +454,13 @@ func (s *StatusLine) renderStatus() string {
 		return result
 	}
 
-	if s.text == "" && s.noSpin {
+	if s.text == "" && frame == "" {
 		return ""
 	}
 
 	var parts []string
 
-	if !s.noSpin {
-		frame := s.frames[s.frameIdx%len(s.frames)]
+	if frame != "" {
 		parts = append(parts, frame)
 	}
 
@@ -457,24 +478,42 @@ func (s *StatusLine) renderStatus() string {
 	return s.style.Render(raw)
 }
 
-// trackContent updates cursor tracking state based on written content.
-// Must be called with mu held.
-func (s *StatusLine) trackContent(p []byte) {
-	for _, b := range p {
-		if b == '\n' {
-			s.lastWasNewline = true
-			s.partialWidth = 0
-		} else {
-			s.lastWasNewline = false
-			s.partialWidth++
-		}
+// spinnerFrame returns the current spinner frame, or an empty string when the
+// spinner is disabled or has no frames.
+func (s *StatusLine) spinnerFrame() string {
+	if s.noSpin || len(s.frames) == 0 {
+		return ""
 	}
+	idx := s.frameIdx % len(s.frames)
+	if idx < 0 {
+		idx += len(s.frames)
+	}
+	return s.frames[idx]
+}
+
+func (s *StatusLine) advanceFrame() {
+	if len(s.frames) == 0 {
+		s.frameIdx = 0
+		return
+	}
+	if s.frameIdx < 0 || s.frameIdx >= len(s.frames)-1 {
+		s.frameIdx = 0
+		return
+	}
+	s.frameIdx++
+}
+
+func (s *StatusLine) currentCursorRow() int {
+	if s.cursorRow != nil {
+		return s.cursorRow()
+	}
+	return s.getCursorRow()
 }
 
 // getCursorRow queries the terminal for the current cursor row using DSR
 // (Device Status Report). Returns 0 if the query fails.
 func (s *StatusLine) getCursorRow() int {
-	tty, err := os.Open("/dev/tty")
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
 		return 0
 	}
@@ -488,8 +527,8 @@ func (s *StatusLine) getCursorRow() int {
 	}
 	defer term.Restore(ttyFd, oldState)
 
-	// Request cursor position — terminal responds with \033[row;colR
-	fmt.Fprint(s.w, "\033[6n")
+	// Request cursor position — terminal responds with \033[row;colR.
+	fmt.Fprint(tty, "\033[6n")
 
 	tty.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 
@@ -523,31 +562,60 @@ func (s *StatusLine) getCursorRow() int {
 // handleResize re-queries terminal size and re-sets the scroll region.
 // Must be called with mu held.
 func (s *StatusLine) handleResize() {
-	w, h, err := term.GetSize(s.fd)
-	if err != nil {
+	s.updateTerminalSize()
+	if s.paused {
 		return
 	}
-	s.width = w
-	s.height = h
 
 	// Save cursor, re-set scroll region, restore cursor.
 	// DECSTBM resets cursor to 1;1, so we bracket with DECSC/DECRC.
-	fmt.Fprint(s.w, "\0337")
-	fmt.Fprintf(s.w, "\033[1;%dr", s.height-1)
-	fmt.Fprint(s.w, "\0338")
-
-	if s.active {
-		s.redraw()
-	}
+	var buf bytes.Buffer
+	fmt.Fprint(&buf, "\0337")
+	fmt.Fprintf(&buf, "\033[1;%dr", s.height-1)
+	fmt.Fprint(&buf, "\0338")
+	s.writeRedraw(&buf)
+	s.w.Write(buf.Bytes())
 }
 
 // resetTerminal restores the terminal to normal state. Must be called with mu held.
 // Safe to call multiple times.
 func (s *StatusLine) resetTerminal() {
+	s.normalizeTerminalSize()
+	var buf bytes.Buffer
 	// Clear the status row before resetting scroll region
-	fmt.Fprintf(s.w, "\033[%d;1H\033[K", s.height)
+	fmt.Fprintf(&buf, "\033[%d;1H\033[K", s.height)
 	// Reset scroll region to full screen
-	fmt.Fprint(s.w, "\033[r")
+	fmt.Fprint(&buf, "\033[r")
 	// Move to bottom and print newline for clean shell prompt
-	fmt.Fprintf(s.w, "\033[%d;1H\n", s.height)
+	fmt.Fprintf(&buf, "\033[%d;1H\n", s.height)
+	s.w.Write(buf.Bytes())
+	s.statusRendered = false
+}
+
+// updateTerminalSize refreshes the cached terminal size and preserves a
+// sensible minimum when the query fails or returns an unusable dimension.
+func (s *StatusLine) updateTerminalSize() {
+	if w, h, err := term.GetSize(s.fd); err == nil {
+		s.width = w
+		s.height = h
+	}
+	s.normalizeTerminalSize()
+}
+
+func (s *StatusLine) normalizeTerminalSize() {
+	if s.width < minWidth {
+		s.width = defaultWidth
+	}
+	if s.height < minHeight {
+		s.height = defaultHeight
+	}
+}
+
+func cloneStrings(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
 }

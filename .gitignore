@@ -1,0 +1,14 @@
+# Go build outputs
+/agent
+/basic
+*.test
+
+# Coverage and profiling artifacts
+coverage.out
+*.coverprofile
+*.prof
+
+# Local editor and OS files
+.DS_Store
+.idea/
+.vscode/

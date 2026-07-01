@@ -3,6 +3,7 @@ package statusline
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 	"sync"
@@ -72,6 +73,34 @@ func (r *writeRecorder) reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.writes = nil
+}
+
+type shortWriter struct{}
+
+func (shortWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	return len(p) - 1, nil
+}
+
+func newTestStatusLine(w io.Writer) *StatusLine {
+	return &StatusLine{
+		w:         w,
+		fd:        -1, // force terminal-size queries to use safe defaults
+		isTTY:     true,
+		width:     defaultWidth,
+		height:    defaultHeight,
+		cursorRow: func() int { return 0 },
+		frames:    cloneStrings(defaultFrames),
+		style:     lipgloss.NewStyle(),
+	}
+}
+
+func newActiveTestStatusLine(w io.Writer) *StatusLine {
+	s := newTestStatusLine(w)
+	s.active = true
+	return s
 }
 
 func TestWriteNonTTY(t *testing.T) {
@@ -185,70 +214,6 @@ func TestRenderStatusFormats(t *testing.T) {
 	}
 }
 
-func TestTrackContent(t *testing.T) {
-	tests := []struct {
-		name           string
-		writes         []string
-		wantNewline    bool
-		wantPartialW   int
-	}{
-		{
-			name:         "newline terminated",
-			writes:       []string{"hello\n"},
-			wantNewline:  true,
-			wantPartialW: 0,
-		},
-		{
-			name:         "no newline",
-			writes:       []string{"hello"},
-			wantNewline:  false,
-			wantPartialW: 5,
-		},
-		{
-			name:         "multi-line newline terminated",
-			writes:       []string{"abc\ndef\n"},
-			wantNewline:  true,
-			wantPartialW: 0,
-		},
-		{
-			name:         "multi-line partial",
-			writes:       []string{"abc\nde"},
-			wantNewline:  false,
-			wantPartialW: 2,
-		},
-		{
-			name:         "just newline",
-			writes:       []string{"\n"},
-			wantNewline:  true,
-			wantPartialW: 0,
-		},
-		{
-			name:         "multi-write sequence",
-			writes:       []string{"abc", "def\n", "gh"},
-			wantNewline:  false,
-			wantPartialW: 2,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s := &StatusLine{
-				lastWasNewline: true,
-				partialWidth:   0,
-			}
-			for _, w := range tt.writes {
-				s.trackContent([]byte(w))
-			}
-			if s.lastWasNewline != tt.wantNewline {
-				t.Fatalf("lastWasNewline = %v, want %v", s.lastWasNewline, tt.wantNewline)
-			}
-			if s.partialWidth != tt.wantPartialW {
-				t.Fatalf("partialWidth = %d, want %d", s.partialWidth, tt.wantPartialW)
-			}
-		})
-	}
-}
-
 func TestSetAndClear(t *testing.T) {
 	t.Run("direct struct access", func(t *testing.T) {
 		s := &StatusLine{
@@ -281,6 +246,43 @@ func TestSetAndClear(t *testing.T) {
 	})
 }
 
+func TestOptions(t *testing.T) {
+	t.Run("without spinner", func(t *testing.T) {
+		var buf bytes.Buffer
+		s := New(&buf, WithoutSpinner())
+		if !s.noSpin {
+			t.Fatal("WithoutSpinner did not disable spinner")
+		}
+	})
+
+	t.Run("style", func(t *testing.T) {
+		var buf bytes.Buffer
+		s := New(&buf, WithStyle(lipgloss.NewStyle().Bold(true)))
+		if !s.style.GetBold() {
+			t.Fatal("WithStyle did not apply style")
+		}
+	})
+
+	t.Run("ellipsis", func(t *testing.T) {
+		var buf bytes.Buffer
+		s := New(&buf, WithEllipsis("…"))
+		if s.ellipsis != "…" {
+			t.Fatalf("ellipsis = %q, want %q", s.ellipsis, "…")
+		}
+	})
+
+	t.Run("fd", func(t *testing.T) {
+		var buf bytes.Buffer
+		s := New(&buf, WithFd(-1))
+		if s.fd != -1 {
+			t.Fatalf("fd = %d, want -1", s.fd)
+		}
+		if s.isTTY {
+			t.Fatal("invalid fd should not force TTY mode")
+		}
+	})
+}
+
 func TestStartStopIdempotent(t *testing.T) {
 	var buf bytes.Buffer
 	s := New(&buf)
@@ -289,6 +291,17 @@ func TestStartStopIdempotent(t *testing.T) {
 	s.Stop()
 	s.Stop()
 	s.Start()
+	s.Start()
+	s.Stop()
+}
+
+func TestStartStopCanRestartTTY(t *testing.T) {
+	rec := &writeRecorder{}
+	s := newTestStatusLine(rec)
+	s.noSpin = true
+
+	s.Start()
+	s.Stop()
 	s.Start()
 	s.Stop()
 }
@@ -340,20 +353,215 @@ func TestTruncationUnicode(t *testing.T) {
 	}
 }
 
+func TestWithoutSpinnerEmptyStatusWritesContentOnly(t *testing.T) {
+	rec := &writeRecorder{}
+	s := newActiveTestStatusLine(rec)
+	s.noSpin = true
+
+	_, err := s.Write([]byte("hello\n"))
+	if err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("Write produced %d underlying writes, want 1", rec.count())
+	}
+	if got := string(rec.writes[0]); got != "hello\n" {
+		t.Fatalf("Write output = %q, want plain content", got)
+	}
+}
+
+func TestClearWithoutSpinnerClearsRenderedStatus(t *testing.T) {
+	rec := &writeRecorder{}
+	s := newActiveTestStatusLine(rec)
+	s.noSpin = true
+	s.text = "Loading"
+	s.statusRendered = true
+
+	s.Clear()
+	if rec.count() != 1 {
+		t.Fatalf("Clear produced %d writes, want 1", rec.count())
+	}
+	if s.statusRendered {
+		t.Fatal("statusRendered = true after clearing empty status")
+	}
+
+	rec.reset()
+	_, err := s.Write([]byte("content\n"))
+	if err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	if got := string(rec.writes[0]); got != "content\n" {
+		t.Fatalf("Write after clear = %q, want plain content", got)
+	}
+}
+
+func TestPauseResume(t *testing.T) {
+	rec := &writeRecorder{}
+	s := newActiveTestStatusLine(rec)
+	s.text = "Ready"
+	s.statusRendered = true
+
+	s.Pause()
+	if !s.paused {
+		t.Fatal("Pause did not mark status line paused")
+	}
+	if s.statusRendered {
+		t.Fatal("Pause left statusRendered true after clearing row")
+	}
+	if rec.count() != 1 {
+		t.Fatalf("Pause produced %d writes, want 1", rec.count())
+	}
+	if !strings.Contains(string(rec.writes[0]), "\033[r") {
+		t.Fatalf("Pause output %q does not reset scroll region", rec.writes[0])
+	}
+
+	rec.reset()
+	s.Set("Paused update")
+	if s.text != "Paused update" {
+		t.Fatalf("paused Set text = %q, want updated text", s.text)
+	}
+	if rec.count() != 0 {
+		t.Fatalf("paused Set produced %d writes, want 0", rec.count())
+	}
+
+	s.Resume()
+	if s.paused {
+		t.Fatal("Resume left status line paused")
+	}
+	if rec.count() != 1 {
+		t.Fatalf("Resume produced %d writes, want 1", rec.count())
+	}
+	resume := string(rec.writes[0])
+	if !strings.Contains(resume, "\033[1;23r") {
+		t.Fatalf("Resume output %q does not restore scroll region", resume)
+	}
+	if !strings.Contains(resume, "Paused update") {
+		t.Fatalf("Resume output %q does not redraw status", resume)
+	}
+}
+
+func TestSetRaw(t *testing.T) {
+	rec := &writeRecorder{}
+	s := newActiveTestStatusLine(rec)
+	raw := "\033[31mred\033[0m"
+
+	s.SetRaw(raw)
+
+	if !s.raw {
+		t.Fatal("SetRaw did not enable raw mode")
+	}
+	if s.text != raw {
+		t.Fatalf("text = %q, want raw text %q", s.text, raw)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("SetRaw produced %d writes, want 1", rec.count())
+	}
+	if !bytes.Contains(rec.writes[0], []byte(raw)) {
+		t.Fatalf("SetRaw output %q does not contain raw text", rec.writes[0])
+	}
+}
+
+func TestWidth(t *testing.T) {
+	s := newTestStatusLine(io.Discard)
+	s.width = 123
+
+	if got := s.Width(); got != 123 {
+		t.Fatalf("Width() = %d, want 123", got)
+	}
+}
+
+func TestSetEmptyWithoutSpinnerAlreadyClearDoesNotWrite(t *testing.T) {
+	rec := &writeRecorder{}
+	s := newActiveTestStatusLine(rec)
+	s.noSpin = true
+
+	s.Set("")
+
+	if rec.count() != 0 {
+		t.Fatalf("Set empty produced %d writes, want 0", rec.count())
+	}
+}
+
+func TestEmptyWriteWithoutStatusDoesNotWrite(t *testing.T) {
+	rec := &writeRecorder{}
+	s := newActiveTestStatusLine(rec)
+	s.noSpin = true
+
+	n, err := s.Write(nil)
+	if err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("Write returned %d, want 0", n)
+	}
+	if rec.count() != 0 {
+		t.Fatalf("empty Write produced %d writes, want 0", rec.count())
+	}
+}
+
+func TestWriteReportsShortUnderlyingWrite(t *testing.T) {
+	s := newActiveTestStatusLine(shortWriter{})
+	s.statusRendered = true
+
+	n, err := s.Write([]byte("content\n"))
+	if err != io.ErrShortWrite {
+		t.Fatalf("Write error = %v, want %v", err, io.ErrShortWrite)
+	}
+	if n != 0 {
+		t.Fatalf("Write returned %d, want 0 on underlying short write", n)
+	}
+}
+
+func TestWithSpinnerCopiesFrames(t *testing.T) {
+	var buf bytes.Buffer
+	frames := []string{"a", "b"}
+	s := New(&buf, WithSpinner(frames, time.Second))
+
+	frames[0] = "mutated"
+
+	if got := s.frames[0]; got != "a" {
+		t.Fatalf("frames[0] = %q, want copied value %q", got, "a")
+	}
+}
+
+func TestRenderStatusWithEmptyFramesDoesNotPanic(t *testing.T) {
+	s := &StatusLine{
+		width:  80,
+		height: 24,
+		isTTY:  true,
+		style:  lipgloss.NewStyle(),
+	}
+	s.text = "No spinner frames"
+
+	got := s.renderStatus()
+	if !strings.Contains(got, s.text) {
+		t.Fatalf("renderStatus() = %q, want text %q", got, s.text)
+	}
+}
+
+func TestSpinnerFrameIndexing(t *testing.T) {
+	s := &StatusLine{frames: []string{"a", "b", "c"}}
+
+	s.frameIdx = -1
+	if got := s.spinnerFrame(); got != "c" {
+		t.Fatalf("spinnerFrame() with negative index = %q, want c", got)
+	}
+
+	s.frameIdx = len(s.frames) - 1
+	s.advanceFrame()
+	if s.frameIdx != 0 {
+		t.Fatalf("advanceFrame() index = %d, want 0", s.frameIdx)
+	}
+}
+
 // --- Flicker-detection tests ---
 // Core invariant: every visible update must be a single Write() call to the
 // underlying writer. Multiple writes = multiple repaints = flicker.
 
 func TestWriteProducesSingleWrite(t *testing.T) {
 	rec := &writeRecorder{}
-	s := &StatusLine{
-		w: rec, isTTY: true, active: true,
-		width: 80, height: 24,
-		frames:         defaultFrames,
-		style:          lipgloss.NewStyle(),
-		lastWasNewline: true,
-		statusRendered: true, // status is already drawn
-	}
+	s := newActiveTestStatusLine(rec)
+	s.statusRendered = true // status is already drawn
 
 	rec.reset()
 	s.Write([]byte("hello\n"))
@@ -375,19 +583,13 @@ func TestWriteProducesSingleWrite(t *testing.T) {
 
 func TestSpinnerTickSingleWrite(t *testing.T) {
 	rec := &writeRecorder{}
-	s := &StatusLine{
-		w: rec, isTTY: true, active: true,
-		width: 80, height: 24,
-		frames:         defaultFrames,
-		style:          lipgloss.NewStyle(),
-		lastWasNewline: true,
-		text:           "Loading...",
-	}
+	s := newActiveTestStatusLine(rec)
+	s.text = "Loading..."
 
 	rec.reset()
 	// Simulate what the spinner goroutine does
 	s.mu.Lock()
-	s.frameIdx++
+	s.advanceFrame()
 	s.redraw()
 	s.mu.Unlock()
 
@@ -398,14 +600,8 @@ func TestSpinnerTickSingleWrite(t *testing.T) {
 
 func TestRapidWritesEachSingleWrite(t *testing.T) {
 	rec := &writeRecorder{}
-	s := &StatusLine{
-		w: rec, isTTY: true, active: true,
-		width: 80, height: 24,
-		frames:         defaultFrames,
-		style:          lipgloss.NewStyle(),
-		lastWasNewline: true,
-		statusRendered: true,
-	}
+	s := newActiveTestStatusLine(rec)
+	s.statusRendered = true
 
 	for i := 0; i < 100; i++ {
 		rec.reset()
@@ -418,14 +614,8 @@ func TestRapidWritesEachSingleWrite(t *testing.T) {
 
 func TestPartialLineThenNewlineSingleWrites(t *testing.T) {
 	rec := &writeRecorder{}
-	s := &StatusLine{
-		w: rec, isTTY: true, active: true,
-		width: 80, height: 24,
-		frames:         defaultFrames,
-		style:          lipgloss.NewStyle(),
-		lastWasNewline: true,
-		statusRendered: true,
-	}
+	s := newActiveTestStatusLine(rec)
+	s.statusRendered = true
 
 	// Write partial line (no newline)
 	rec.reset()
@@ -451,14 +641,8 @@ func TestPartialLineThenNewlineSingleWrites(t *testing.T) {
 
 func TestSetProducesSingleWrite(t *testing.T) {
 	rec := &writeRecorder{}
-	s := &StatusLine{
-		w: rec, isTTY: true, active: true,
-		width: 80, height: 24,
-		frames:         defaultFrames,
-		style:          lipgloss.NewStyle(),
-		lastWasNewline: true,
-		statusRendered: true,
-	}
+	s := newActiveTestStatusLine(rec)
+	s.statusRendered = true
 
 	rec.reset()
 	s.Set("new status text")
@@ -467,16 +651,68 @@ func TestSetProducesSingleWrite(t *testing.T) {
 	}
 }
 
+func TestHandleResizeProducesSingleWrite(t *testing.T) {
+	rec := &writeRecorder{}
+	s := newActiveTestStatusLine(rec)
+	s.text = "resized"
+
+	s.mu.Lock()
+	s.handleResize()
+	s.mu.Unlock()
+
+	if rec.count() != 1 {
+		t.Fatalf("handleResize produced %d writes, want 1", rec.count())
+	}
+	blob := string(rec.writes[0])
+	if !strings.Contains(blob, "\033[1;23r") {
+		t.Fatalf("resize output %q does not reset scroll region", blob)
+	}
+	if !strings.Contains(blob, s.text) {
+		t.Fatalf("resize output %q does not redraw status %q", blob, s.text)
+	}
+}
+
+func TestHandleResizeWhilePausedDoesNotWrite(t *testing.T) {
+	rec := &writeRecorder{}
+	s := newActiveTestStatusLine(rec)
+	s.paused = true
+
+	s.mu.Lock()
+	s.handleResize()
+	s.mu.Unlock()
+
+	if rec.count() != 0 {
+		t.Fatalf("paused handleResize produced %d writes, want 0", rec.count())
+	}
+}
+
+func TestResetTerminalProducesSingleWrite(t *testing.T) {
+	rec := &writeRecorder{}
+	s := newActiveTestStatusLine(rec)
+	s.statusRendered = true
+
+	s.mu.Lock()
+	s.resetTerminal()
+	s.mu.Unlock()
+
+	if rec.count() != 1 {
+		t.Fatalf("resetTerminal produced %d writes, want 1", rec.count())
+	}
+	if s.statusRendered {
+		t.Fatal("resetTerminal left statusRendered true")
+	}
+	blob := string(rec.writes[0])
+	for _, want := range []string{"\033[24;1H\033[K", "\033[r", "\033[24;1H\n"} {
+		if !strings.Contains(blob, want) {
+			t.Fatalf("resetTerminal output %q missing %q", blob, want)
+		}
+	}
+}
+
 func TestConcurrentWriteAndSetNoInterleaving(t *testing.T) {
 	rec := &writeRecorder{}
-	s := &StatusLine{
-		w: rec, isTTY: true, active: true,
-		width: 80, height: 24,
-		frames:         defaultFrames,
-		style:          lipgloss.NewStyle(),
-		lastWasNewline: true,
-		statusRendered: true,
-	}
+	s := newActiveTestStatusLine(rec)
+	s.statusRendered = true
 
 	var wg sync.WaitGroup
 	// Writers
@@ -501,11 +737,11 @@ func TestConcurrentWriteAndSetNoInterleaving(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Structural guard: if save/restore cursor is ever added, catch interleaving
+	// Structural guard: save/restore cursor sequences must stay balanced.
 	for i, w := range rec.writes {
 		blob := string(w)
-		saves := strings.Count(blob, "\033[s")
-		restores := strings.Count(blob, "\033[u")
+		saves := strings.Count(blob, "\0337") + strings.Count(blob, "\033[s")
+		restores := strings.Count(blob, "\0338") + strings.Count(blob, "\033[u")
 		if saves != restores {
 			t.Errorf("write %d has %d saves but %d restores — interleaved!", i, saves, restores)
 		}
@@ -532,14 +768,8 @@ func TestConcurrentWriteAndSetNoInterleaving(t *testing.T) {
 
 func TestStreamingWithConcurrentStatusUpdates(t *testing.T) {
 	rec := &writeRecorder{}
-	s := &StatusLine{
-		w: rec, isTTY: true, active: true,
-		width: 80, height: 24,
-		frames:         defaultFrames,
-		style:          lipgloss.NewStyle(),
-		lastWasNewline: true,
-		statusRendered: true,
-	}
+	s := newActiveTestStatusLine(rec)
+	s.statusRendered = true
 
 	streamText := `Here's what I found after analyzing the codebase:
 
@@ -591,7 +821,7 @@ Run go test to verify the changes work correctly.
 		defer wg.Done()
 		for i := 0; i < 20; i++ {
 			s.mu.Lock()
-			s.frameIdx++
+			s.advanceFrame()
 			s.redraw()
 			s.mu.Unlock()
 			time.Sleep(2 * time.Millisecond)
