@@ -89,6 +89,8 @@ go run ./examples/basic     # simple download + compile simulation
 go run ./examples/agent     # AI agent streaming text with tool activity
 ```
 
+Demo video: https://ttjrqwhkxenoqcuxfesn.supabase.co/storage/v1/object/public/agent-media/videos/f6fed541-1e04-4e69-992d-89aba4057ded/1783485813728-statusline-playwright-demo.webm
+
 ## License
 
 MIT
